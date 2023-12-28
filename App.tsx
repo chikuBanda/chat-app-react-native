@@ -3,6 +3,7 @@ import { ScrollView, Text, View, Image, TextInput, Button, ToastAndroid } from "
 import MyComponent from "./src/components/MyComponent";
 import axios, { AxiosResponse } from "axios";
 import { io } from 'socket.io-client'
+import { MediaStream, RTCPeerConnection, RTCSessionDescription, RTCView, mediaDevices } from "react-native-webrtc";
 
 interface IceServer {
   urls: string,
@@ -28,22 +29,143 @@ const App = () => {
   const [ iceServerList, setIceServerList ] = useState<IceServer[]>([{'urls': 'stun:stun.l.google.com:19302'}])
   const iceServersUrl = 'https://chat-app-server-gmhe.onrender.com/chat/get_ice_servers'
 
-  const MyServers = () => {
-    return iceServerList.map((obj, index) => {
-      return <Text key={ 'key' + index }>{ obj.urls }</Text>
-    })
+  let mediaConstraints = {
+    audio: true,
+    video: {
+      frameRate: 30,
+      facingMode: 'user'
+    }
   }
+
+  let [ localMediaStream, setLocalMediaStream ] = useState<MediaStream>()
+  let [ remoteMediaStream, setRemoteMediaStream ] = useState<MediaStream>()
+  let isVoiceOnly = false
+
+  const startCamera = async () => {
+    try {
+      const mediaStream = await mediaDevices.getUserMedia( mediaConstraints )
+  
+      if ( isVoiceOnly ) {
+        let videoTrack = await mediaStream.getVideoTracks()[0]
+        videoTrack.enabled = false
+      }
+  
+      setLocalMediaStream(mediaStream)
+    } catch (err) {
+      console.error('Error getting media stream', err)
+    }
+  }
+
+  let peerConstraints = {
+    iceServers: [
+      {
+        urls: 'stun:stun.l.google.com:19302'
+      }
+    ]
+  }
+
+  let peerConnection = new RTCPeerConnection( peerConstraints )
 
   useEffect(() => {
     axios.get(iceServersUrl)
       .then((response: AxiosResponse<IceServer[]>) => {
+        console.log("received servers", response.data)
         setIceServerList(response.data)
+        peerConnection.setConfiguration({
+            iceServers: iceServerList
+        })
       })
   }, [])
+
+  useEffect(() => {
+      if (localMediaStream != undefined) {
+          localMediaStream.getTracks().forEach(track => {
+            // @ts-ignore
+              peerConnection.addTrack(track, localMediaStream)
+          })
+      }
+  }, [ localMediaStream ])
 
   socket.on('sendMessage', (arg: Message) => {
     console.log('received message', arg)
     setChat(prevArray => [...prevArray, arg])
+  })
+
+  socket.on('offer', async (arg: any) => {
+    console.log('received offer')
+
+    if (arg.offer) {
+      try {
+        if (peerConnection.signalingState !== 'stable') {
+          console.warn('Cannot handle offer in signaling state:', peerConnection.signalingState)
+          return
+        }
+  
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(arg.offer))
+        console.log('set offer as remote desc')
+
+        const answer = await peerConnection.createAnswer()
+        console.log('created answer')
+
+        await peerConnection.setLocalDescription(answer)
+        console.log('set answer as local desc.')
+
+        console.log('signaling state', peerConnection.signalingState)
+  
+        sendMessage('answer', { answer })
+        console.log('sending answer...')
+      } catch(err) {
+        console.error('Error setting remote description', err)
+      }
+    }
+  })
+
+  socket.on('answer', async (arg: any) => {
+    console.log('received answer')
+    console.log('answer message', arg)
+
+    try {
+      if (arg.answer) {
+        console.log('signaling state', peerConnection.signalingState)
+        const remoteDesc = new RTCSessionDescription(arg.answer)
+
+        await peerConnection.setRemoteDescription(remoteDesc)
+        console.log('set answer as remote desc')
+
+        console.log('signaling state', peerConnection.signalingState)
+      }
+    } catch (err) {
+      console.error('Error set answer as remote desc')
+    }
+  })
+
+  socket.on('new-ice-candidate', async (arg: any) => {
+      if (arg.ice_candidate) {
+          try {
+              await peerConnection.addIceCandidate(arg.ice_candidate)
+          } catch (e) {
+              console.error('Error adding received ice candidate', e)
+          }
+      }
+  })
+
+  peerConnection.addEventListener('icecandidate', event => {
+      console.log('on icecandidate')
+      if (event.candidate) {
+          sendMessage('new-ice-candidate', { ice_candidate: event.candidate })
+      }
+  })
+
+  peerConnection.addEventListener('connectionstatechange', event => {
+      console.log('connectionstatechange', event)
+      if (peerConnection.connectionState === 'connected') {
+          console.log("CONNECTED")
+      }
+  })
+
+  peerConnection.addEventListener('track', (event) => {
+      const [remoteStream] = event.streams
+      setRemoteMediaStream(remoteStream)
   })
 
   const register = () => {
@@ -85,28 +207,67 @@ const App = () => {
     }
   }
 
+  const sendMessage = (eventName: string, msgObject: any) => {
+    const msg = {
+        sender_id: username, 
+        receiver_id: receiver, 
+        ...msgObject
+    }
+    socket.emit(eventName, msg, onServerResponse)
+}
+
+  let sessionConstraints = {
+    mandatory: {
+      OfferToReceiveAudio: true,
+      OfferToReceiveVideo: true,
+      VoiceActivityDetection: true
+    }
+  };
+
+  const makeCall = async () => {
+    try {
+      const offerDescription = await peerConnection.createOffer({
+        OfferToReceiveAudio: true,
+        OfferToReceiveVideo: true
+      });
+      console.log('created offer')
+
+      await peerConnection.setLocalDescription(offerDescription)
+      console.log('set offer as local desc')
+
+      sendMessage('offer', { offer: offerDescription })
+      console.log('Making call...')
+      console.log('Sending offer...')
+    } catch( err ) {
+      console.error('Error creating offer', err)
+    };
+  }
+
   return (
     <ScrollView style={{ padding: 10 }}>
-      <Text>Some text</Text>
-      <View>
-        <Text>Some more text</Text>
-        <Image
-          source={{
-            uri: 'https://reactnative.dev/docs/assets/p_cat2.png'
-          }}
-          style={ { width: 200, height: 200 } }
+      <View style={{ marginBottom: 10 }}>
+        <RTCView
+          mirror={ true }
+          objectFit={ 'cover' }
+          streamURL={ localMediaStream?.toURL() }
+          zOrder={0}
+          style={{ height: 150, width: 150 }}
         />
+      </View>
+
+      <View>
+        <RTCView
+            mirror={ true }
+            objectFit={ 'cover' }
+            streamURL={ remoteMediaStream?.toURL() }
+            zOrder={0}
+            style={{ height: 150, width: 150 }}
+          />
       </View>
 
       <View>
         { renderChat() }
       </View>
-
-      {/* <MyComponent name="Chiku" girlfriend="Sibo" thoughts={ thoughts } />
-
-      <View>
-        { MyServers() }
-      </View> */}
 
       <View>
         <Text>Your name</Text>
@@ -139,6 +300,16 @@ const App = () => {
             title="Connect"
             disabled={ username == '' || username === null }
             onPress={ () => register() }
+          />
+
+          <Button
+            title="Get camera"
+            onPress={ () => startCamera() }
+          />
+
+          <Button
+            title="Call"
+            onPress={ () => makeCall() }
           />
       </View>
 
